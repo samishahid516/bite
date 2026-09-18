@@ -1,7 +1,9 @@
 import crypto from 'node:crypto'
-import { User } from '../models/User.js'
+import bcrypt from 'bcrypt'
+import { supabase } from '../config/db.js'
 import { ApiError } from '../utils/ApiError.js'
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/jwt.js'
+import { rowToDoc } from '../utils/serialize.js'
 
 function toPublicUser(user) {
   return {
@@ -11,20 +13,32 @@ function toPublicUser(user) {
     phone: user.phone,
     role: user.role,
     profileImage: user.profileImage,
-    addresses: user.addresses,
-    favorites: user.favorites,
     isActive: user.isActive,
     createdAt: user.createdAt
   }
 }
 
 export async function registerCustomer({ name, email, phone, password }) {
-  const existing = await User.findOne({ email })
+  const { data: existing, error: existErr } = await supabase
+    .from('users')
+    .select('id')
+    .eq('email', email)
+    .maybeSingle()
+  if (existErr) throw ApiError.badRequest(existErr.message)
   if (existing) {
     throw ApiError.conflict('An account with this email already exists')
   }
 
-  const user = await User.create({ name, email, phone, password, role: 'CUSTOMER' })
+  const hashedPassword = await bcrypt.hash(password, 12)
+
+  const { data, error } = await supabase
+    .from('users')
+    .insert({ name, email, phone, password: hashedPassword, role: 'CUSTOMER' })
+    .select('*')
+    .single()
+  if (error) throw ApiError.badRequest(error.message)
+
+  const user = rowToDoc(data)
   const accessToken = signAccessToken(user)
   const refreshToken = signRefreshToken(user)
 
@@ -32,10 +46,15 @@ export async function registerCustomer({ name, email, phone, password }) {
 }
 
 export async function login({ email, password }) {
-  const user = await User.findOne({ email }).select('+password')
-  if (!user || !(await user.comparePassword(password))) {
+  const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle()
+  if (error) throw ApiError.badRequest(error.message)
+
+  if (!data || !(await bcrypt.compare(password, data.password))) {
     throw ApiError.unauthorized('Invalid email or password')
   }
+
+  const user = rowToDoc(data)
+
   if (!user.isActive) {
     throw ApiError.forbidden('This account has been disabled')
   }
@@ -58,7 +77,10 @@ export async function refreshSession(refreshToken) {
     throw ApiError.unauthorized('Invalid or expired refresh token')
   }
 
-  const user = await User.findById(payload.sub)
+  const { data, error } = await supabase.from('users').select('*').eq('id', payload.sub).maybeSingle()
+  if (error) throw ApiError.badRequest(error.message)
+
+  const user = data ? rowToDoc(data) : null
   if (!user || !user.isActive || user.refreshTokenVersion !== payload.tokenVersion) {
     throw ApiError.unauthorized('Session is no longer valid')
   }
@@ -79,24 +101,37 @@ export async function logout(refreshToken) {
     return
   }
 
-  const user = await User.findById(payload.sub)
-  if (user) {
-    user.refreshTokenVersion += 1
-    await user.save()
+  const { data } = await supabase
+    .from('users')
+    .select('refresh_token_version')
+    .eq('id', payload.sub)
+    .maybeSingle()
+
+  if (data) {
+    await supabase
+      .from('users')
+      .update({ refresh_token_version: data.refresh_token_version + 1 })
+      .eq('id', payload.sub)
   }
 }
 
 export async function requestPasswordReset(email) {
-  const user = await User.findOne({ email })
-  if (!user) {
+  const { data, error } = await supabase.from('users').select('id').eq('email', email).maybeSingle()
+  if (error) throw ApiError.badRequest(error.message)
+
+  if (!data) {
     // Do not reveal whether the account exists.
     return { devResetToken: null }
   }
 
   const rawToken = crypto.randomBytes(32).toString('hex')
-  user.resetPasswordTokenHash = crypto.createHash('sha256').update(rawToken).digest('hex')
-  user.resetPasswordExpires = new Date(Date.now() + 30 * 60 * 1000)
-  await user.save()
+  const resetPasswordTokenHash = crypto.createHash('sha256').update(rawToken).digest('hex')
+  const resetPasswordExpires = new Date(Date.now() + 30 * 60 * 1000).toISOString()
+
+  await supabase
+    .from('users')
+    .update({ reset_password_token_hash: resetPasswordTokenHash, reset_password_expires: resetPasswordExpires })
+    .eq('id', data.id)
 
   // No email provider is configured yet; returning the token here is a dev-only
   // convenience so the reset flow is fully testable end-to-end.
@@ -105,20 +140,30 @@ export async function requestPasswordReset(email) {
 
 export async function resetPassword(token, newPassword) {
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
-  const user = await User.findOne({
-    resetPasswordTokenHash: tokenHash,
-    resetPasswordExpires: { $gt: new Date() }
-  }).select('+resetPasswordTokenHash +resetPasswordExpires')
 
-  if (!user) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, refresh_token_version')
+    .eq('reset_password_token_hash', tokenHash)
+    .gt('reset_password_expires', new Date().toISOString())
+    .maybeSingle()
+  if (error) throw ApiError.badRequest(error.message)
+
+  if (!data) {
     throw ApiError.badRequest('Reset token is invalid or has expired')
   }
 
-  user.password = newPassword
-  user.resetPasswordTokenHash = null
-  user.resetPasswordExpires = null
-  user.refreshTokenVersion += 1
-  await user.save()
+  const hashedPassword = await bcrypt.hash(newPassword, 12)
+
+  await supabase
+    .from('users')
+    .update({
+      password: hashedPassword,
+      reset_password_token_hash: null,
+      reset_password_expires: null,
+      refresh_token_version: data.refresh_token_version + 1
+    })
+    .eq('id', data.id)
 }
 
 export { toPublicUser }

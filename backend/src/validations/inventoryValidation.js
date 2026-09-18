@@ -1,5 +1,6 @@
 import Joi from 'joi'
-import { INVENTORY_UNITS } from '../models/InventoryItem.js'
+
+const INVENTORY_UNITS = ['pcs', 'kg', 'g', 'l', 'ml', 'pack']
 
 export const createInventoryItemSchema = Joi.object({
   name: Joi.string().trim().min(2).max(100).required(),

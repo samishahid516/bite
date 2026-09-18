@@ -1,54 +1,87 @@
-import { User } from '../models/User.js'
-import { Product } from '../models/Product.js'
+import { supabase } from '../config/db.js'
 import { ApiError } from '../utils/ApiError.js'
+import { rowToDoc } from '../utils/serialize.js'
+
+async function getFavoriteProductIds(userId) {
+  const { data, error } = await supabase.from('user_favorites').select('product_id').eq('user_id', userId)
+  if (error) throw ApiError.badRequest(error.message)
+  return data.map((r) => r.product_id)
+}
 
 export async function addFavorite(userId, productId) {
-  const user = await User.findById(userId)
-  if (!user) throw ApiError.notFound('User not found')
-
-  const product = await Product.findById(productId)
+  const { data: product, error: productErr } = await supabase
+    .from('products')
+    .select('id')
+    .eq('id', productId)
+    .maybeSingle()
+  if (productErr) throw ApiError.badRequest(productErr.message)
   if (!product) throw ApiError.notFound('Product not found')
 
-  // Check if already favorited
-  if (user.favorites.includes(productId)) {
+  const { data: existing, error: existErr } = await supabase
+    .from('user_favorites')
+    .select('product_id')
+    .eq('user_id', userId)
+    .eq('product_id', productId)
+    .maybeSingle()
+  if (existErr) throw ApiError.badRequest(existErr.message)
+  if (existing) {
     throw ApiError.conflict('This product is already in your favorites')
   }
 
-  user.favorites.push(productId)
-  await user.save()
+  const { error } = await supabase.from('user_favorites').insert({ user_id: userId, product_id: productId })
+  if (error) throw ApiError.badRequest(error.message)
 
-  return user.populate('favorites')
+  const favorites = await getFavoriteProductIds(userId)
+  return { favorites }
 }
 
 export async function removeFavorite(userId, productId) {
-  const user = await User.findById(userId)
-  if (!user) throw ApiError.notFound('User not found')
-
-  const index = user.favorites.findIndex((id) => id.toString() === productId)
-  if (index === -1) {
+  const { data: existing, error: existErr } = await supabase
+    .from('user_favorites')
+    .select('product_id')
+    .eq('user_id', userId)
+    .eq('product_id', productId)
+    .maybeSingle()
+  if (existErr) throw ApiError.badRequest(existErr.message)
+  if (!existing) {
     throw ApiError.notFound('Product not in favorites')
   }
 
-  user.favorites.splice(index, 1)
-  await user.save()
+  const { error } = await supabase
+    .from('user_favorites')
+    .delete()
+    .eq('user_id', userId)
+    .eq('product_id', productId)
+  if (error) throw ApiError.badRequest(error.message)
 
-  return user.populate('favorites')
+  const favorites = await getFavoriteProductIds(userId)
+  return { favorites }
 }
 
 export async function getUserFavorites(userId, { page = 1, limit = 20 } = {}) {
-  const user = await User.findById(userId)
-    .populate({
-      path: 'favorites',
-      model: 'Product',
-      select: 'name slug description basePrice discountPrice images rating reviewCount isAvailable isFeatured isPopular'
-    })
+  page = Number(page) || 1
+  limit = Number(limit) || 20
 
-  if (!user) throw ApiError.notFound('User not found')
+  const { data: favRows, error: favErr, count } = await supabase
+    .from('user_favorites')
+    .select('product_id', { count: 'exact' })
+    .eq('user_id', userId)
+    .range((page - 1) * limit, (page - 1) * limit + limit - 1)
+  if (favErr) throw ApiError.badRequest(favErr.message)
 
-  const total = user.favorites.length
-  const start = (page - 1) * limit
-  const end = start + limit
-  const favorites = user.favorites.slice(start, end)
+  const productIds = favRows.map((r) => r.product_id)
+  let favorites = []
+  if (productIds.length > 0) {
+    const { data: products, error: prodErr } = await supabase
+      .from('products')
+      .select('name, slug, description, base_price, discount_price, images, rating, review_count, is_available, is_featured, is_popular, id')
+      .in('id', productIds)
+    if (prodErr) throw ApiError.badRequest(prodErr.message)
+    const productMap = new Map(products.map((p) => [p.id, p]))
+    favorites = productIds.map((id) => rowToDoc(productMap.get(id))).filter(Boolean)
+  }
+
+  const total = count || 0
 
   return {
     favorites,
@@ -57,8 +90,12 @@ export async function getUserFavorites(userId, { page = 1, limit = 20 } = {}) {
 }
 
 export async function isFavorite(userId, productId) {
-  const user = await User.findById(userId)
-  if (!user) throw ApiError.notFound('User not found')
-
-  return user.favorites.some((id) => id.toString() === productId)
+  const { data, error } = await supabase
+    .from('user_favorites')
+    .select('product_id')
+    .eq('user_id', userId)
+    .eq('product_id', productId)
+    .maybeSingle()
+  if (error) throw ApiError.badRequest(error.message)
+  return Boolean(data)
 }

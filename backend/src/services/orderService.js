@@ -1,13 +1,22 @@
-import { Order, ORDER_STATUS_VALUES } from '../models/Order.js'
-import { Product } from '../models/Product.js'
-import { Deal } from '../models/Deal.js'
-import { Branch } from '../models/Branch.js'
-import { DeliveryArea } from '../models/DeliveryArea.js'
-import { Coupon } from '../models/Coupon.js'
+import { supabase } from '../config/db.js'
 import { ApiError } from '../utils/ApiError.js'
+import { rowToDoc } from '../utils/serialize.js'
+import { isCurrentlyOpen } from './branchService.js'
 import * as inventoryService from './inventoryService.js'
 
 const TAX_RATE = 0.17 // 17% GST
+
+export const ORDER_STATUS_VALUES = [
+  'PENDING',
+  'CONFIRMED',
+  'PREPARING',
+  'READY',
+  'OUT_FOR_DELIVERY',
+  'DELIVERED',
+  'CANCELLED'
+]
+
+const ORDER_SELECT = '*, user:users(id, name, email, phone), branch:branches(id, name, city, area, phone), delivery_area:delivery_areas(id, name, delivery_fee)'
 
 function generateOrderNumber() {
   const timestamp = Date.now().toString().slice(-8)
@@ -27,15 +36,27 @@ export async function createOrder(user, orderData) {
   } = orderData
 
   // Validate branch exists and is currently open
-  const branchDoc = await Branch.findById(branch)
-  if (!branchDoc) throw ApiError.notFound('Branch not found')
+  const { data: branchRow, error: branchErr } = await supabase
+    .from('branches')
+    .select('*')
+    .eq('id', branch)
+    .maybeSingle()
+  if (branchErr) throw ApiError.badRequest(branchErr.message)
+  if (!branchRow) throw ApiError.notFound('Branch not found')
+  const branchDoc = rowToDoc(branchRow)
   if (!branchDoc.isActive) throw ApiError.badRequest('This branch is not currently accepting orders')
-  if (!branchDoc.isCurrentlyOpen()) throw ApiError.badRequest('This branch is closed at the moment')
+  if (!isCurrentlyOpen(branchDoc)) throw ApiError.badRequest('This branch is closed at the moment')
 
   // Validate delivery area exists and belongs to branch
-  const deliveryAreaDoc = await DeliveryArea.findById(deliveryArea)
-  if (!deliveryAreaDoc) throw ApiError.notFound('Delivery area not found')
-  if (deliveryAreaDoc.branch.toString() !== branch) {
+  const { data: areaRow, error: areaErr } = await supabase
+    .from('delivery_areas')
+    .select('*')
+    .eq('id', deliveryArea)
+    .maybeSingle()
+  if (areaErr) throw ApiError.badRequest(areaErr.message)
+  if (!areaRow) throw ApiError.notFound('Delivery area not found')
+  const deliveryAreaDoc = rowToDoc(areaRow)
+  if (deliveryAreaDoc.branchId !== branch) {
     throw ApiError.badRequest('Delivery area does not belong to this branch')
   }
   if (!deliveryAreaDoc.isActive) throw ApiError.badRequest('Delivery to this area is not available')
@@ -47,16 +68,24 @@ export async function createOrder(user, orderData) {
   const processedItems = []
 
   for (const item of items) {
-    let productDoc = null
     let unitPrice = 0
 
     if (item.itemType === 'PRODUCT' && item.product) {
-      productDoc = await Product.findById(item.product)
-      if (!productDoc) throw ApiError.notFound(`Product not found: ${item.product}`)
+      const { data: productRow, error: productErr } = await supabase
+        .from('products')
+        .select('*')
+        .eq('id', item.product)
+        .maybeSingle()
+      if (productErr) throw ApiError.badRequest(productErr.message)
+      if (!productRow) throw ApiError.notFound(`Product not found: ${item.product}`)
+      const productDoc = rowToDoc(productRow)
       if (!productDoc.isAvailable) throw ApiError.badRequest(`Product not available: ${productDoc.name}`)
 
       // Start with base price
-      unitPrice = productDoc.effectivePrice
+      unitPrice =
+        productDoc.discountPrice != null && productDoc.discountPrice < productDoc.basePrice
+          ? productDoc.discountPrice
+          : productDoc.basePrice
 
       // Add price adjustments for size, crust, toppings, extras if selected
       if (item.size) {
@@ -80,11 +109,17 @@ export async function createOrder(user, orderData) {
         }
       }
     } else if (item.itemType === 'DEAL' && item.deal) {
-      const dealDoc = await Deal.findById(item.deal)
-      if (!dealDoc) throw ApiError.notFound(`Deal not found: ${item.deal}`)
+      const { data: dealRow, error: dealErr } = await supabase
+        .from('deals')
+        .select('*')
+        .eq('id', item.deal)
+        .maybeSingle()
+      if (dealErr) throw ApiError.badRequest(dealErr.message)
+      if (!dealRow) throw ApiError.notFound(`Deal not found: ${item.deal}`)
+      const dealDoc = rowToDoc(dealRow)
       if (!dealDoc.isActive) throw ApiError.badRequest(`Deal not available: ${dealDoc.name}`)
       const now = new Date()
-      if (dealDoc.startDate > now || dealDoc.endDate < now) {
+      if (new Date(dealDoc.startDate) > now || new Date(dealDoc.endDate) < now) {
         throw ApiError.badRequest(`Deal is not currently active: ${dealDoc.name}`)
       }
       unitPrice = dealDoc.discountPrice
@@ -118,10 +153,16 @@ export async function createOrder(user, orderData) {
   // Validate and apply coupon
   let couponDiscount = 0
   if (couponCode) {
-    const coupon = await Coupon.findOne({ code: couponCode.toUpperCase() })
-    if (!coupon) throw ApiError.notFound('Coupon code not found')
+    const { data: couponRow, error: couponErr } = await supabase
+      .from('coupons')
+      .select('*')
+      .eq('code', couponCode.toUpperCase())
+      .maybeSingle()
+    if (couponErr) throw ApiError.badRequest(couponErr.message)
+    if (!couponRow) throw ApiError.notFound('Coupon code not found')
+    const coupon = rowToDoc(couponRow)
     if (!coupon.isActive) throw ApiError.badRequest('This coupon is no longer valid')
-    if (coupon.expiryDate < new Date()) throw ApiError.badRequest('This coupon has expired')
+    if (new Date(coupon.expiryDate) < new Date()) throw ApiError.badRequest('This coupon has expired')
     if (coupon.usageLimit && coupon.usedCount >= coupon.usageLimit) {
       throw ApiError.badRequest('This coupon has reached its usage limit')
     }
@@ -145,51 +186,60 @@ export async function createOrder(user, orderData) {
   const total = subtotal - couponDiscount + deliveryFee + tax
 
   // Create order
-  const order = await Order.create({
-    orderNumber: generateOrderNumber(),
-    user: user ? user._id : null,
-    branch,
-    items: processedItems,
-    deliveryAddress,
-    deliveryArea,
-    subtotal,
-    couponCode: couponCode ? couponCode.toUpperCase() : null,
-    couponDiscount,
-    deliveryFee,
-    tax,
-    total,
-    paymentMethod,
-    specialInstructions: specialInstructions || '',
-    statusHistory: [
-      {
-        status: 'PENDING',
-        changedBy: null,
-        note: 'Order created',
-        timestamp: new Date()
-      }
-    ]
-  })
+  const { data: orderRow, error: orderErr } = await supabase
+    .from('orders')
+    .insert({
+      order_number: generateOrderNumber(),
+      user_id: user ? user._id : null,
+      branch_id: branch,
+      items: processedItems,
+      delivery_address: deliveryAddress,
+      delivery_area_id: deliveryArea,
+      subtotal,
+      coupon_code: couponCode ? couponCode.toUpperCase() : null,
+      coupon_discount: couponDiscount,
+      delivery_fee: deliveryFee,
+      tax,
+      total,
+      payment_method: paymentMethod,
+      special_instructions: specialInstructions || '',
+      status_history: [
+        {
+          status: 'PENDING',
+          changedBy: null,
+          note: 'Order created',
+          timestamp: new Date().toISOString()
+        }
+      ]
+    })
+    .select(ORDER_SELECT)
+    .single()
+  if (orderErr) throw ApiError.badRequest(orderErr.message)
 
   // Increment coupon usedCount atomically
   if (couponCode) {
-    await Coupon.findOneAndUpdate({ code: couponCode.toUpperCase() }, { $inc: { usedCount: 1 } })
+    const { data: couponRow } = await supabase
+      .from('coupons')
+      .select('used_count')
+      .eq('code', couponCode.toUpperCase())
+      .maybeSingle()
+    if (couponRow) {
+      await supabase
+        .from('coupons')
+        .update({ used_count: couponRow.used_count + 1 })
+        .eq('code', couponCode.toUpperCase())
+    }
   }
 
-  return order.populate([
-    { path: 'user', select: 'name email phone' },
-    { path: 'branch', select: 'name city area phone' },
-    { path: 'deliveryArea', select: 'name deliveryFee' }
-  ])
+  return rowToDoc(orderRow)
 }
 
 export async function getOrder(userId, orderId) {
-  const order = await Order.findById(orderId)
-    .populate('user', 'name email phone')
-    .populate('branch', 'name city area phone')
-    .populate('deliveryArea', 'name deliveryFee')
-    .populate('items.product', 'name image')
+  const { data, error } = await supabase.from('orders').select(ORDER_SELECT).eq('id', orderId).maybeSingle()
+  if (error) throw ApiError.badRequest(error.message)
+  if (!data) throw ApiError.notFound('Order not found')
 
-  if (!order) throw ApiError.notFound('Order not found')
+  const order = rowToDoc(data)
 
   // Guest orders (no associated account) can be viewed by anyone with the order ID.
   // Orders placed by a registered user can only be viewed by that same user.
@@ -201,75 +251,81 @@ export async function getOrder(userId, orderId) {
 }
 
 export async function getCustomerOrders(userId, { page = 1, limit = 10 } = {}) {
-  const [orders, total] = await Promise.all([
-    Order.find({ user: userId })
-      .populate('branch', 'name city')
-      .populate('deliveryArea', 'name')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit),
-    Order.countDocuments({ user: userId })
-  ])
+  page = Number(page) || 1
+  limit = Number(limit) || 10
+
+  const { data, error, count } = await supabase
+    .from('orders')
+    .select('*, branch:branches(id, name, city), delivery_area:delivery_areas(id, name)', { count: 'exact' })
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .range((page - 1) * limit, (page - 1) * limit + limit - 1)
+  if (error) throw ApiError.badRequest(error.message)
+
+  const total = count || 0
 
   return {
-    orders,
+    orders: rowToDoc(data),
     pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) }
   }
 }
 
 export async function listAllOrders(query, { page = 1, limit = 20 } = {}) {
-  const filter = {}
+  page = Number(page) || 1
+  limit = Number(limit) || 20
+
+  let q = supabase
+    .from('orders')
+    .select('*, user:users(id, name, email, phone), branch:branches(id, name, city), delivery_area:delivery_areas(id, name)', { count: 'exact' })
 
   if (query.status) {
     if (!ORDER_STATUS_VALUES.includes(query.status.toUpperCase())) {
       throw ApiError.badRequest('Invalid order status')
     }
-    filter.orderStatus = query.status.toUpperCase()
+    q = q.eq('order_status', query.status.toUpperCase())
   }
 
-  if (query.branch) filter.branch = query.branch
-  if (query.user) filter.user = query.user
+  if (query.branch) q = q.eq('branch_id', query.branch)
+  if (query.user) q = q.eq('user_id', query.user)
 
-  if (query.dateFrom || query.dateTo) {
-    filter.createdAt = {}
-    if (query.dateFrom) filter.createdAt.$gte = new Date(query.dateFrom)
-    if (query.dateTo) {
-      const dateTo = new Date(query.dateTo)
-      dateTo.setHours(23, 59, 59, 999)
-      filter.createdAt.$lte = dateTo
-    }
+  if (query.dateFrom) q = q.gte('created_at', new Date(query.dateFrom).toISOString())
+  if (query.dateTo) {
+    const dateTo = new Date(query.dateTo)
+    dateTo.setHours(23, 59, 59, 999)
+    q = q.lte('created_at', dateTo.toISOString())
   }
 
   const sortMap = {
-    newest: { createdAt: -1 },
-    oldest: { createdAt: 1 },
-    total_high: { total: -1 },
-    total_low: { total: 1 }
+    newest: { column: 'created_at', ascending: false },
+    oldest: { column: 'created_at', ascending: true },
+    total_high: { column: 'total', ascending: false },
+    total_low: { column: 'total', ascending: true }
   }
-  const sort = sortMap[query.sort] || { createdAt: -1 }
+  const sort = sortMap[query.sort] || { column: 'created_at', ascending: false }
+  q = q.order(sort.column, { ascending: sort.ascending })
+  q = q.range((page - 1) * limit, (page - 1) * limit + limit - 1)
 
-  const [orders, total] = await Promise.all([
-    Order.find(filter)
-      .populate('user', 'name email phone')
-      .populate('branch', 'name city')
-      .populate('deliveryArea', 'name')
-      .sort(sort)
-      .skip((page - 1) * limit)
-      .limit(limit),
-    Order.countDocuments(filter)
-  ])
+  const { data, error, count } = await q
+  if (error) throw ApiError.badRequest(error.message)
+
+  const total = count || 0
 
   return {
-    orders,
+    orders: rowToDoc(data),
     pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) }
   }
 }
 
 export async function updateOrderStatus(orderId, newStatus, changedBy, note = '') {
-  const order = await Order.findById(orderId)
-  if (!order) throw ApiError.notFound('Order not found')
+  const { data: orderRow, error: getErr } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('id', orderId)
+    .maybeSingle()
+  if (getErr) throw ApiError.badRequest(getErr.message)
+  if (!orderRow) throw ApiError.notFound('Order not found')
 
-  const currentStatus = order.orderStatus
+  const currentStatus = orderRow.order_status
   newStatus = newStatus.toUpperCase()
 
   if (!ORDER_STATUS_VALUES.includes(newStatus)) {
@@ -288,37 +344,40 @@ export async function updateOrderStatus(orderId, newStatus, changedBy, note = ''
   }
 
   if (!validTransitions[currentStatus] || !validTransitions[currentStatus].includes(newStatus)) {
-    throw ApiError.badRequest(
-      `Cannot transition from ${currentStatus} to ${newStatus}`
-    )
+    throw ApiError.badRequest(`Cannot transition from ${currentStatus} to ${newStatus}`)
   }
 
-  order.orderStatus = newStatus
-  order.statusHistory.push({
-    status: newStatus,
-    changedBy,
-    note,
-    timestamp: new Date()
-  })
+  const statusHistory = [
+    ...(orderRow.status_history || []),
+    { status: newStatus, changedBy, note, timestamp: new Date().toISOString() }
+  ]
 
-  await order.save()
+  const { data: updated, error: updateErr } = await supabase
+    .from('orders')
+    .update({ order_status: newStatus, status_history: statusHistory })
+    .eq('id', orderId)
+    .select('*, user:users(id, name, email, phone), branch:branches(id, name, city), delivery_area:delivery_areas(id, name)')
+    .single()
+  if (updateErr) throw ApiError.badRequest(updateErr.message)
 
   // Deduct recipe ingredients from stock the moment an order is confirmed
   if (newStatus === 'CONFIRMED') {
-    await inventoryService.deductForOrder(order)
+    await inventoryService.deductForOrder(rowToDoc(updated))
   }
 
-  return order
-    .populate('user', 'name email phone')
-    .populate('branch', 'name city')
-    .populate('deliveryArea', 'name')
+  return rowToDoc(updated)
 }
 
 export async function cancelOrder(orderId, cancelledBy = null) {
-  const order = await Order.findById(orderId)
-  if (!order) throw ApiError.notFound('Order not found')
+  const { data: orderRow, error: getErr } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('id', orderId)
+    .maybeSingle()
+  if (getErr) throw ApiError.badRequest(getErr.message)
+  if (!orderRow) throw ApiError.notFound('Order not found')
 
-  const currentStatus = order.orderStatus
+  const currentStatus = orderRow.order_status
 
   // Customer can only cancel PENDING or CONFIRMED orders
   if (!cancelledBy) {
@@ -327,72 +386,56 @@ export async function cancelOrder(orderId, cancelledBy = null) {
     }
   }
   // Admin can cancel any order except DELIVERED or already CANCELLED
-  else if (!['DELIVERED', 'CANCELLED'].includes(currentStatus)) {
-    // Admin cancellation is allowed
-  } else {
+  else if (['DELIVERED', 'CANCELLED'].includes(currentStatus)) {
     throw ApiError.badRequest('This order cannot be cancelled')
   }
 
-  order.orderStatus = 'CANCELLED'
-  order.statusHistory.push({
-    status: 'CANCELLED',
-    changedBy: cancelledBy,
-    note: 'Order cancelled',
-    timestamp: new Date()
-  })
+  const statusHistory = [
+    ...(orderRow.status_history || []),
+    { status: 'CANCELLED', changedBy: cancelledBy, note: 'Order cancelled', timestamp: new Date().toISOString() }
+  ]
 
-  await order.save()
-  return order
-    .populate('user', 'name email phone')
-    .populate('branch', 'name city')
-    .populate('deliveryArea', 'name')
+  const { data: updated, error: updateErr } = await supabase
+    .from('orders')
+    .update({ order_status: 'CANCELLED', status_history: statusHistory })
+    .eq('id', orderId)
+    .select('*, user:users(id, name, email, phone), branch:branches(id, name, city), delivery_area:delivery_areas(id, name)')
+    .single()
+  if (updateErr) throw ApiError.badRequest(updateErr.message)
+
+  return rowToDoc(updated)
 }
 
 export async function getOrderStats(query = {}) {
-  const pipeline = []
+  let q = supabase.from('orders').select('total, order_status, created_at')
 
-  // Add date filtering if provided
-  if (query.dateFrom || query.dateTo) {
-    const match = {}
-    if (query.dateFrom) match.createdAt = { $gte: new Date(query.dateFrom) }
-    if (query.dateTo) {
-      const dateTo = new Date(query.dateTo)
-      dateTo.setHours(23, 59, 59, 999)
-      if (match.createdAt) {
-        match.createdAt.$lte = dateTo
-      } else {
-        match.createdAt = { $lte: dateTo }
-      }
-    }
-    if (Object.keys(match).length > 0) pipeline.push({ $match: match })
+  if (query.dateFrom) q = q.gte('created_at', new Date(query.dateFrom).toISOString())
+  if (query.dateTo) {
+    const dateTo = new Date(query.dateTo)
+    dateTo.setHours(23, 59, 59, 999)
+    q = q.lte('created_at', dateTo.toISOString())
   }
 
-  // Group and aggregate
-  pipeline.push({
-    $group: {
-      _id: null,
-      totalOrders: { $sum: 1 },
-      totalRevenue: { $sum: '$total' },
-      averageOrderValue: { $avg: '$total' },
-      deliveredOrders: {
-        $sum: { $cond: [{ $eq: ['$orderStatus', 'DELIVERED'] }, 1, 0] }
-      },
-      pendingOrders: {
-        $sum: { $cond: [{ $eq: ['$orderStatus', 'PENDING'] }, 1, 0] }
-      },
-      cancelledOrders: {
-        $sum: { $cond: [{ $eq: ['$orderStatus', 'CANCELLED'] }, 1, 0] }
-      }
-    }
-  })
+  const { data, error } = await q
+  if (error) throw ApiError.badRequest(error.message)
 
-  const result = await Order.aggregate(pipeline)
-  return result[0] || {
-    totalOrders: 0,
-    totalRevenue: 0,
-    averageOrderValue: 0,
-    deliveredOrders: 0,
-    pendingOrders: 0,
-    cancelledOrders: 0
+  if (!data || data.length === 0) {
+    return {
+      totalOrders: 0,
+      totalRevenue: 0,
+      averageOrderValue: 0,
+      deliveredOrders: 0,
+      pendingOrders: 0,
+      cancelledOrders: 0
+    }
   }
+
+  const totalOrders = data.length
+  const totalRevenue = data.reduce((sum, o) => sum + Number(o.total), 0)
+  const averageOrderValue = totalRevenue / totalOrders
+  const deliveredOrders = data.filter((o) => o.order_status === 'DELIVERED').length
+  const pendingOrders = data.filter((o) => o.order_status === 'PENDING').length
+  const cancelledOrders = data.filter((o) => o.order_status === 'CANCELLED').length
+
+  return { totalOrders, totalRevenue, averageOrderValue, deliveredOrders, pendingOrders, cancelledOrders }
 }

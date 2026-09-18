@@ -1,29 +1,20 @@
-import mongoose from 'mongoose'
-import dns from 'node:dns'
+import { createClient } from '@supabase/supabase-js'
 import { env } from './env.js'
 
-mongoose.set('strictQuery', true)
-
-// Node's built-in DNS resolver fails SRV lookups (mongodb+srv://) against
-// some ISP router DNS servers. Point it at public DNS resolvers instead.
-dns.setServers(['8.8.8.8', '1.1.1.1'])
+export const supabase = createClient(env.supabaseUrl, env.supabaseSecretKey, {
+  auth: { persistSession: false }
+})
 
 export async function connectDB() {
-  mongoose.connection.on('connected', () => {
-    console.log(`[mongo] connected -> ${mongoose.connection.name}`)
-  })
-
-  mongoose.connection.on('error', (err) => {
-    console.error('[mongo] connection error:', err.message)
-  })
-
-  mongoose.connection.on('disconnected', () => {
-    console.warn('[mongo] disconnected')
-  })
-
-  await mongoose.connect(env.mongoUri)
+  const { error } = await supabase.from('users').select('id').limit(1)
+  if (error) {
+    throw new Error(`[supabase] connection check failed: ${error.message}`)
+  }
+  console.log('[supabase] connected ->', env.supabaseUrl)
 }
 
 export async function disconnectDB() {
-  await mongoose.disconnect()
+  // Supabase's client is a plain HTTP client -- there is no persistent
+  // connection to tear down, but this is kept so callers (seeders/index.js,
+  // server.js) don't need to know that.
 }

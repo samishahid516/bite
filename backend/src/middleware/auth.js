@@ -1,7 +1,8 @@
 import { ApiError } from '../utils/ApiError.js'
 import { asyncHandler } from '../utils/asyncHandler.js'
 import { verifyAccessToken } from '../utils/jwt.js'
-import { User } from '../models/User.js'
+import { supabase } from '../config/db.js'
+import { rowToDoc } from '../utils/serialize.js'
 
 export const authenticate = asyncHandler(async (req, res, next) => {
   const header = req.headers.authorization || ''
@@ -18,7 +19,10 @@ export const authenticate = asyncHandler(async (req, res, next) => {
     throw ApiError.unauthorized('Invalid or expired token')
   }
 
-  const user = await User.findById(payload.sub)
+  const { data, error } = await supabase.from('users').select('*').eq('id', payload.sub).maybeSingle()
+  if (error) throw ApiError.badRequest(error.message)
+
+  const user = data ? rowToDoc(data) : null
   if (!user || !user.isActive) {
     throw ApiError.unauthorized('Account not found or disabled')
   }
@@ -46,7 +50,8 @@ export const optionalAuthenticate = asyncHandler(async (req, res, next) => {
 
   try {
     const payload = verifyAccessToken(token)
-    const user = await User.findById(payload.sub)
+    const { data } = await supabase.from('users').select('*').eq('id', payload.sub).maybeSingle()
+    const user = data ? rowToDoc(data) : null
     if (user && user.isActive) req.user = user
   } catch {
     // ignore invalid token for optional auth
