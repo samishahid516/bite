@@ -1,8 +1,8 @@
 import Joi from 'joi'
 
 export const createReviewSchema = Joi.object({
-  productId: Joi.string().hex().length(24).required(),
-  orderId: Joi.string().hex().length(24).required(),
+  productId: Joi.string().guid({ version: 'uuidv4' }).required(),
+  orderId: Joi.string().guid({ version: 'uuidv4' }).required(),
   rating: Joi.number().integer().min(1).max(5).required(),
   comment: Joi.string().allow('').max(500)
 })

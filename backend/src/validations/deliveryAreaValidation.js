@@ -1,7 +1,7 @@
 import Joi from 'joi'
 
 export const createDeliveryAreaSchema = Joi.object({
-  branch: Joi.string().hex().length(24).required(),
+  branch: Joi.string().guid({ version: 'uuidv4' }).required(),
   name: Joi.string().trim().min(2).max(100).required(),
   deliveryFee: Joi.number().min(0).required(),
   minimumOrder: Joi.number().min(0).default(0),
@@ -15,6 +15,6 @@ export const updateDeliveryAreaSchema = createDeliveryAreaSchema.fork(
 )
 
 export const checkDeliveryQuerySchema = Joi.object({
-  branch: Joi.string().hex().length(24).required(),
+  branch: Joi.string().guid({ version: 'uuidv4' }).required(),
   area: Joi.string().trim().required()
 })

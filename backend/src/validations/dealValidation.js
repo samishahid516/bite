@@ -1,7 +1,7 @@
 import Joi from 'joi'
 
 const dealProduct = Joi.object({
-  product: Joi.string().hex().length(24).required(),
+  product: Joi.string().guid({ version: 'uuidv4' }).required(),
   quantity: Joi.number().integer().min(1).default(1),
   size: Joi.string().allow(null, '')
 })
@@ -15,7 +15,7 @@ export const createDealSchema = Joi.object({
   discountPrice: Joi.number().min(0).required(),
   startDate: Joi.date().required(),
   endDate: Joi.date().greater(Joi.ref('startDate')).required(),
-  branch: Joi.string().hex().length(24).allow(null),
+  branch: Joi.string().guid({ version: 'uuidv4' }).allow(null),
   isActive: Joi.boolean()
 })
 

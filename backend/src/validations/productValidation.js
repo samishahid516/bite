@@ -6,14 +6,14 @@ const priceOption = Joi.object({
 })
 
 const recipeItem = Joi.object({
-  item: Joi.string().hex().length(24).required(),
+  item: Joi.string().guid({ version: 'uuidv4' }).required(),
   quantity: Joi.number().min(0).required()
 })
 
 export const createProductSchema = Joi.object({
   name: Joi.string().trim().min(2).max(100).required(),
   description: Joi.string().trim().allow('').max(1000),
-  category: Joi.string().hex().length(24).required(),
+  category: Joi.string().guid({ version: 'uuidv4' }).required(),
   images: Joi.array().items(Joi.string()).default([]),
   basePrice: Joi.number().min(0).required(),
   discountPrice: Joi.number().min(0).allow(null),
@@ -34,7 +34,7 @@ export const updateProductSchema = createProductSchema.fork(
 )
 
 export const listProductsQuerySchema = Joi.object({
-  category: Joi.string().hex().length(24),
+  category: Joi.string().guid({ version: 'uuidv4' }),
   search: Joi.string().trim().allow(''),
   minPrice: Joi.number().min(0),
   maxPrice: Joi.number().min(0),

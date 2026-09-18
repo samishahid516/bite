@@ -2,12 +2,12 @@ import Joi from 'joi'
 
 const orderItemSchema = Joi.object({
   itemType: Joi.string().valid('PRODUCT', 'DEAL').required(),
-  product: Joi.string().hex().length(24).when('itemType', {
+  product: Joi.string().guid({ version: 'uuidv4' }).when('itemType', {
     is: 'PRODUCT',
     then: Joi.required(),
     otherwise: Joi.optional().allow(null)
   }),
-  deal: Joi.string().hex().length(24).when('itemType', {
+  deal: Joi.string().guid({ version: 'uuidv4' }).when('itemType', {
     is: 'DEAL',
     then: Joi.required(),
     otherwise: Joi.optional().allow(null)
@@ -24,7 +24,7 @@ const orderItemSchema = Joi.object({
 })
 
 export const createOrderSchema = Joi.object({
-  branch: Joi.string().hex().length(24).required(),
+  branch: Joi.string().guid({ version: 'uuidv4' }).required(),
   items: Joi.array().items(orderItemSchema).min(1).required(),
   deliveryAddress: Joi.object({
     name: Joi.string().trim().required(),
@@ -37,7 +37,7 @@ export const createOrderSchema = Joi.object({
     longitude: Joi.number().allow(null),
     instructions: Joi.string().trim().allow('')
   }).required(),
-  deliveryArea: Joi.string().hex().length(24).required(),
+  deliveryArea: Joi.string().guid({ version: 'uuidv4' }).required(),
   paymentMethod: Joi.string().valid('COD', 'ONLINE').default('COD'),
   couponCode: Joi.string().uppercase().trim().allow(null, ''),
   specialInstructions: Joi.string().trim().allow('')
@@ -50,7 +50,7 @@ export const getCustomerOrdersQuerySchema = Joi.object({
 
 export const listAllOrdersQuerySchema = Joi.object({
   status: Joi.string(),
-  branch: Joi.string().hex().length(24),
+  branch: Joi.string().guid({ version: 'uuidv4' }),
   dateFrom: Joi.date(),
   dateTo: Joi.date(),
   page: Joi.number().integer().min(1).default(1),

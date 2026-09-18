@@ -1,7 +1,7 @@
 import Joi from 'joi'
 
 export const addFavoriteSchema = Joi.object({
-  productId: Joi.string().hex().length(24).required()
+  productId: Joi.string().guid({ version: 'uuidv4' }).required()
 })
 
 export const getUserFavoritesQuerySchema = Joi.object({
