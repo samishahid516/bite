@@ -1,7 +1,8 @@
+import { ApiError } from '../utils/ApiError.js'
 import { sendError } from '../utils/apiResponse.js'
 
 export function notFoundHandler(req, res, next) {
-  next(new Error(`Route not found: ${req.method} ${req.originalUrl}`))
+  next(ApiError.notFound(`Route not found: ${req.method} ${req.originalUrl}`))
 }
 
 export function errorHandler(err, req, res, next) {
